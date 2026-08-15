@@ -339,6 +339,13 @@ class Hub:
                     print('[m5hub] 🌙 Экран погашен (Fn+Backspace)')
                     self._kl=0
                     return
+                # Fn+Enter (0xA3) — открыть «Обзор» (GNOME Overview / список программ)
+                if k==0xA3:
+                    subprocess.run(['xdotool','key','Super_L'], capture_output=True,
+                                   env={'DISPLAY':os.environ.get('DISPLAY',':0')})
+                    print('[m5hub] 🗂️ Обзор (GNOME Overview)')
+                    self._kl=0
+                    return
                 if self._kl and self._kl in CKM: self._kv(CKM[self._kl],0,self._kl)
                 if k and k in CKM: self._kv(CKM[k],1,k)
                 self._kl=k
