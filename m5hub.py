@@ -171,7 +171,7 @@ class Hub:
             bd=self.rd(0,0x63,0x20,1)
             bp=(bd[0]==0) if bd else False
             now=time.time()
-            if bp and not self._jb and (now-self._jt)>0.3:
+            if bp and not self._jb and (now-self._jt)>0.15:
                 self._jb=True; self._jt=now
                 self._led_j(0,0,50)  # синий
                 self._cl(1)
