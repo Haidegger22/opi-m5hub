@@ -9,7 +9,7 @@ m5hub.py v9 — стабильная версия
 5. Увеличенная dead zone 6000
 """
 
-import os, fcntl, time, ctypes, subprocess, collections, statistics
+import os, fcntl, time, ctypes, subprocess, collections, statistics, math
 from Xlib import display, X
 from Xlib.ext import xtest
 
@@ -86,6 +86,15 @@ class Hub:
 
         # Фиксированный масштаб (никакой авто-калибровки!)
         self._scale=32768.0
+
+        # ── Калибровка джойстика ──
+        self.DZ_ON = 8000     # вход в движение (гистерезис): mag >= 8000
+        self.DZ_OFF = 5000    # выход из движения: mag < 5000
+        self.SNAP = True      # snap к направлениям (эмуляция D-pad)
+        self.SNAP_DIRS = 4    # 4 = только оси (вверх/вниз/влево/вправо); 8 = + диагонали
+        self.DIR_HYST = 10    # угловой гистерезис (градусы): насколько нужно отойти от текущего направления, чтобы оно сменилось
+        self._moving = False  # флаг гистерезиса (магнитуда)
+        self._dir = None      # текущее направление (для углового гистерезиса)
 
         self._err_count=0
         self._jb=False  # кнопка джойстика
@@ -173,11 +182,21 @@ class Hub:
         except:
             pass
 
-        # Dead zone + сброс фильтра при остановке
-        if abs(dx)<6000 and abs(dy)<6000:
-            self._dx_hist.clear()
-            self._dy_hist.clear()
-            return
+        # Гистерезис по магнитуде: вход в движение при mag>=DZ_ON,
+        # выход при mag<DZ_OFF. Убирает дребезг на границе и случайные
+        # срабатывания от малых отклонений (серая зона с хаотичным углом).
+        mag = math.hypot(dx, dy)
+        if self._moving:
+            if mag < self.DZ_OFF:
+                self._moving = False
+                self._dir = None
+                self._dx_hist.clear()
+                self._dy_hist.clear()
+                return
+        else:
+            if mag < self.DZ_ON:
+                return
+            self._moving = True
 
         # Сброс фильтра при смене направления (убирает "эффект памяти")
         if self._dx_hist:
@@ -189,11 +208,34 @@ class Hub:
             if (prev>0)!=(dy>0) and abs(dy)>4000:
                 self._dy_hist.clear()
 
-        # Медианный фильтр
+        # Медианный фильтр ПЕРЕД snap — сглаживает резкие переходы между
+        # осями, чтобы snap не выдал ложную диагональ в момент смены направления
         self._dx_hist.append(dx)
         self._dy_hist.append(dy)
         sdx=statistics.median(self._dx_hist)
         sdy=statistics.median(self._dy_hist)
+
+        # Snap к ближайшему направлению (эмуляция D-pad) по сглаженным
+        # значениям. Угловой гистерезис: текущее направление «липкое» — чтобы
+        # сменить его, нужно уйти чётко в сторону соседнего (иначе малый наклон
+        # дёргает направление туда-сюда).
+        if self.SNAP:
+            smag = math.hypot(sdx, sdy)
+            if smag > 0:
+                deg = (math.degrees(math.atan2(sdy, sdx)) + 360.0) % 360.0
+                step = 360.0 / self.SNAP_DIRS
+                cand = int(round(deg / step)) % self.SNAP_DIRS
+                if self._dir is None:
+                    self._dir = cand
+                else:
+                    def _ad(a, b):
+                        d = abs(a - b) % 360.0
+                        return min(d, 360.0 - d)
+                    if _ad(deg, cand * step) < _ad(deg, self._dir * step) - self.DIR_HYST:
+                        self._dir = cand
+                a = math.radians(self._dir * step)
+                sdx = int(round(math.cos(a) * smag))
+                sdy = int(round(math.sin(a) * smag))
 
         # Простой линейный scale
         sx=int(sdx/self._scale*110)
