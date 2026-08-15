@@ -29,6 +29,7 @@ def i2c_wr(fd, ad, da):
     wd=d(ctypes.pointer(mg),1)
     _g.extend([b,mg,wd])
     fcntl.ioctl(fd,I2C_RDWR,wd)
+    _g.clear()  # освобождаем буферы сразу — иначе утечка памяти
     time.sleep(0.002)
 
 def i2c_rd(fd, ad, re, n):
@@ -37,7 +38,9 @@ def i2c_rd(fd, ad, re, n):
     ms=(m*2)(m0,m1); wd=d(ms,2)
     _g.extend([wb,rb,m0,m1,ms,wd])
     fcntl.ioctl(fd,I2C_RDWR,wd)
-    return bytes(rb)
+    out=bytes(rb)
+    _g.clear()  # освобождаем буферы сразу — иначе утечка памяти
+    return out
 
 def i2c_rr(fd, ad, n):
     rb=(ctypes.c_uint8*n)()
@@ -45,7 +48,9 @@ def i2c_rr(fd, ad, n):
     wd=d(ctypes.pointer(mg),1)
     _g.extend([rb,mg,wd])
     fcntl.ioctl(fd,I2C_RDWR,wd)
-    return bytes(rb)
+    out=bytes(rb)
+    _g.clear()  # освобождаем буферы сразу — иначе утечка памяти
+    return out
 
 
 class Hub:
@@ -119,17 +124,26 @@ class Hub:
         return i2c_rr(self.fd,a,n)
 
     def _cal(self):
-        """Калибровка центра джойстика"""
-        sx=sy=n=0
+        """Калибровка центра джойстика — устойчивая к выбросам (I2C-мусор после жёсткого kill)"""
+        samples=[]
         for _ in range(50):
             try:
                 d=self.rd(0,0x63,0x00,4)
-                sx+=d[0]|(d[1]<<8); sy+=d[2]|(d[3]<<8); n+=1
+                samples.append((d[0]|(d[1]<<8), d[2]|(d[3]<<8)))
             except: pass
             time.sleep(0.01)
-        if n:
-            self._cx,self._cy=sx//n,sy//n
-            print(f"[m5hub] ⚙️ Центр: X={self._cx} Y={self._cy} (n={n})")
+        if samples:
+            xs=sorted(s[0] for s in samples); ys=sorted(s[1] for s in samples)
+            mx=xs[len(xs)//2]; my=ys[len(ys)//2]
+            # Отбрасываем выбросы (дальше 4000 от медианы)
+            good=[(x,y) for x,y in samples if abs(x-mx)<4000 and abs(y-my)<4000]
+            if good:
+                self._cx=sum(g[0] for g in good)//len(good)
+                self._cy=sum(g[1] for g in good)//len(good)
+                print(f"[m5hub] ⚙️ Центр: X={self._cx} Y={self._cy} (n={len(good)}/{len(samples)})")
+            else:
+                self._cx,self._cy=mx,my
+                print(f"[m5hub] ⚙️ Центр(медиана): X={self._cx} Y={self._cy}")
 
     def _j(self):
         try:
@@ -246,6 +260,7 @@ class Hub:
             wd=d(ctypes.pointer(mg),1)
             _g.extend([ba,mg,wd])
             fcntl.ioctl(self.fd,I2C_RDWR,wd)
+            _g.clear()  # освобождаем буферы сразу — иначе утечка памяти
         except:
             pass
 
@@ -275,6 +290,13 @@ class Hub:
                     subprocess.run(['setxkbmap',self._layout], capture_output=True,
                                    env={'DISPLAY':os.environ.get('DISPLAY',':0')})
                     print(f'[m5hub] Раскладка: {self._layout.upper()}')
+                # Fn+Backspace (0x8B) — гашение экрана (экономия зарядки)
+                if k==0x8B:
+                    subprocess.run(['xset','dpms','force','off'], capture_output=True,
+                                   env={'DISPLAY':os.environ.get('DISPLAY',':0')})
+                    print('[m5hub] 🌙 Экран погашен (Fn+Backspace)')
+                    self._kl=0
+                    return
                 if self._kl and self._kl in CKM: self._kv(CKM[self._kl],0,self._kl)
                 if k and k in CKM: self._kv(CKM[k],1,k)
                 self._kl=k
@@ -344,7 +366,10 @@ class Hub:
         print(f"[m5hub] Off (ошибок I2C: {self._err_count})")
 
     def cleanup(self):
-        self._led(0,0,0); os.close(self.fd); self.d.close()
+        self._led(0,0,0)
+        try: self._rst()  # сброс PaHub — чтобы шина не осталась залипшей
+        except: pass
+        os.close(self.fd); self.d.close()
         # Restore original layout
         subprocess.run(['setxkbmap','us,ru,ru'], capture_output=True,
                        env={'DISPLAY':os.environ.get('DISPLAY',':0')})
@@ -389,7 +414,13 @@ CKM = {
 
 
 if __name__=='__main__':
-    import sys; os.environ.setdefault('DISPLAY',':0')
+    import sys, signal; os.environ.setdefault('DISPLAY',':0')
     h=Hub()
+    def _term(sig,frm):
+        print('[m5hub] SIGTERM — чистое завершение')
+        try: h.cleanup()
+        except Exception as e: print('[m5hub] cleanup err:', e)
+        os._exit(0)
+    signal.signal(signal.SIGTERM,_term)
     try: h.run()
     except KeyboardInterrupt: h.cleanup()
