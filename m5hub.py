@@ -9,9 +9,14 @@ m5hub.py v9 — стабильная версия
 5. Увеличенная dead zone 6000
 """
 
-import os, fcntl, time, ctypes, subprocess, collections, statistics, math
+import os, fcntl, time, ctypes, subprocess, collections, statistics, math, json, queue, threading
 from Xlib import display, X
 from Xlib.ext import xtest
+
+try:
+    import gi
+except ImportError:
+    gi = None
 
 I2C_BUS=0; I2C_RDWR=0x0707; I2C_M_RD=1
 
@@ -69,10 +74,13 @@ class Hub:
         self._t={'j':0,'s':0,'k':0}
         self._sb=False; self._sf=False; self._sp=0
         self._kl=0
-        self._bs_last=0.0      # last Backspace timestamp
-        self._bs_repeat=False  # auto-repeat active
-        self._bs_next=0.0      # next repeat timestamp
         self._layout='us'        # current keyboard layout
+        self._t9=None            # T9Engine (лениво, при первом включении)
+        self._t9_active=False    # Т9-режим (Fn+Tab)
+        self._t9_osd=None        # T9OSD-окно (лениво)
+        self._t9_led_t=0         # таймер поддержания LED джойстика
+        self._t9_caps=False      # следующее Т9-слово — с заглавной (Shift+буква или Sym+цифра)
+        self._t9_prev_layout='us'  # раскладка до включения Т9
         self._cx=self._cy=32768
 
         # Виртуальная позиция (вместо query_pointer)
@@ -313,43 +321,202 @@ class Hub:
                 # DEBUG: log raw codes to /tmp/cardkb.log
                 with open('/tmp/cardkb.log','a') as f:
                     f.write(f'{time.time():.3f} raw=0x{k:02X} prev=0x{self._kl:02X}\n')
-                # Double-tap Backspace detection
-                now=time.time()
-                if k==0x08:
-                    if self._bs_last>0 and now-self._bs_last<0.8:
-                        self._bs_repeat=True
-                        self._bs_next=now+0.2
-                        print("[m5hub] BS auto-repeat (double-tap)")
-                    self._bs_last=now
-                elif k and k!=0:
-                    if self._bs_repeat:
-                        print("[m5hub] BS auto-repeat off")
-                    self._bs_repeat=False
-                    self._bs_last=0
                 # Fn+Space (0xAF) — переключение раскладки US/RU
                 if k==0xAF:
                     self._layout='ru' if self._layout=='us' else 'us'
                     subprocess.run(['setxkbmap',self._layout], capture_output=True,
-                                   env={'DISPLAY':os.environ.get('DISPLAY',':0')})
+                                   env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
+                    time.sleep(0.1)
+                    self._layout=self._real_layout()  # GNOME мог не дать переключить — честная синхронизация
                     print(f'[m5hub] Раскладка: {self._layout.upper()}')
                 # Fn+Backspace (0x8B) — гашение экрана (экономия зарядки)
                 if k==0x8B:
                     subprocess.run(['xset','dpms','force','off'], capture_output=True,
-                                   env={'DISPLAY':os.environ.get('DISPLAY',':0')})
+                                   env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
                     print('[m5hub] 🌙 Экран погашен (Fn+Backspace)')
                     self._kl=0
                     return
                 # Fn+Enter (0xA3) — открыть «Обзор» (GNOME Overview / список программ)
                 if k==0xA3:
                     subprocess.run(['xdotool','key','Super_L'], capture_output=True,
-                                   env={'DISPLAY':os.environ.get('DISPLAY',':0')})
+                                   env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
                     print('[m5hub] 🗂️ Обзор (GNOME Overview)')
                     self._kl=0
+                    return
+                # Fn+Tab (0x8C) — включить/выключить Т9-режим (русский ввод)
+                if k==0x8C:
+                    self._t9_toggle()
+                    self._kl=0
+                    return
+                # Т9-режим: перехват цифр/стрелок/подтверждения, остальное — нативно
+                if self._t9_active and self._t9_handle(k):
+                    self._kl=k
                     return
                 if self._kl and self._kl in CKM: self._kv(CKM[self._kl],0,self._kl)
                 if k and k in CKM: self._kv(CKM[k],1,k)
                 self._kl=k
         except: pass
+
+    # ── Т9-режим (русский набор цифрами) ──────────────────────────────
+    def _t9_toggle(self):
+        if not self._t9_active:
+            if self._t9 is None:
+                self._t9=T9Engine()
+            self._t9_prev_layout=self._real_layout()  # запомнить, что было до Т9
+            self._t9_active=True
+            # Т9 = русский ввод: принудительно ru — никакого смешения рус/лат
+            if self._real_layout()!='ru':
+                subprocess.run(['setxkbmap','ru'], capture_output=True,
+                               env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
+                time.sleep(0.15)
+            self._layout='ru'
+            self._led_j(0,80,0)  # зелёный LED — Т9 включён (STM32G0 может гаснуть по таймауту — цикл будет обновлять)
+            self._t9_led_t=0
+            print('[m5hub] ⌨️ Т9 ВКЛ: 2-9 буквы, ←/→ выбор, Space/Enter подтвердить, Esc сброс, Fn+Tab выкл')
+            self._t9_osd_show()
+        else:
+            self._t9_active=False
+            self._t9.reset()
+            self._t9_caps=False
+            # вернуть раскладку, которая была до включения Т9
+            if self._real_layout()!=self._t9_prev_layout:
+                subprocess.run(['setxkbmap',self._t9_prev_layout], capture_output=True,
+                               env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
+                time.sleep(0.15)
+            self._layout=self._t9_prev_layout
+            self._led_j(0,0,0)   # LED погашен — Т9 выключен
+            print('[m5hub] ⌨️ Т9 ВЫКЛ')
+            self._t9_osd_hide()
+
+    def _t9_handle(self,k):
+        """Обработка клавиш в Т9-режиме. True — клавиша съедена."""
+        t=self._t9
+        # ── multi-tap (ручной ввод слова) ──
+        if t.mt:
+            if 0x32<=k<=0x39:            # 2-9 — буква (повтор <0.5с — следующая)
+                t.mt_digit(chr(k),time.time()); self._t9_osd_show(); return True
+            if k==0x08:                  # Backspace — стереть букву
+                t.mt_backspace(); self._t9_osd_show(); return True
+            if k in (0x0D,0x20):         # Enter/Space — слово готово
+                w=t.mt_finish()
+                if w:
+                    t.add_word(w)
+                    self._t9_save()
+                    self._t9_type(w,True)
+                self._t9_osd_hide(); return True
+            if k==0x1B:                  # Esc — отмена ручного ввода
+                t.mt_cancel(); t.reset(); self._t9_osd_show(); return True
+            return False                 # остальное — нативно
+        # Shift+буква (0x41-0x5A) — следующее слово с заглавной (буква не вводится)
+        if 0x41<=k<=0x5A:
+            self._t9_caps=True
+            self._t9_osd_show(); return True
+        # Sym+цифра (!@#$%^&*() — уникальные коды) — цифра с заглавной
+        SYM_D={0x21:'1',0x40:'2',0x23:'3',0x24:'4',0x25:'5',0x5E:'6',0x26:'7',0x2A:'8',0x28:'9',0x29:'0'}
+        if k in SYM_D:
+            self._t9_caps=True
+            t.add_digit(SYM_D[k]); self._t9_osd_show(); return True
+        if k==0x30:                  # 0 — тоже пробел (подтвердить + пробел, или просто пробел)
+            if t.seq:
+                w=t.confirm()
+                if w: self._t9_type(w,True)
+                self._t9_osd_hide(); return True
+            self._kv(0x0020,1,0x20); self._kv(0x0020,0,0x20)
+            self._kl=k; return True
+        if 0x32<=k<=0x39:            # 2-9 — цифры набора
+            t.add_digit(chr(k)); self._t9_osd_show(); return True
+        if k==0x08 and t.seq:        # Backspace — стереть цифру
+            t.backspace(); self._t9_osd_show(); return True
+        if k==0xB4:                  # ← — предыдущий кандидат
+            t.prev_cand(); self._t9_osd_show(); return True
+        if k==0xB7:                  # → — следующий кандидат
+            t.next_cand(); self._t9_osd_show(); return True
+        if k==0x20 and t.seq:        # Space — подтвердить + пробел
+            w=t.confirm()
+            if w: self._t9_type(w,True)
+            self._t9_osd_hide(); return True
+        if k==0x0D and t.seq:        # Enter — подтвердить без пробела, при пустом словаре — ручной ввод
+            w=t.confirm()
+            if w:
+                self._t9_type(w,False)
+            else:
+                t.mt_start()          # слова нет — переходим в multi-tap
+            self._t9_osd_show(); return True
+        if k==0x1B and t.seq:        # Esc — только сброс набора (выход — только Fn+Tab)
+            t.reset(); self._t9_osd_show(); return True
+        return False
+
+    def _t9_save(self):
+        """Сохранить словарь (после добавления нового слова)."""
+        try:
+            with open(_T9_BASE,'w',encoding='utf-8') as f:
+                json.dump(self._t9.base,f,ensure_ascii=False,separators=(',',':'))
+            print(f'[m5hub] 📖 Словарь обновлён ({len(self._t9.base)} цепочек)')
+        except Exception as e:
+            print('[m5hub] Словарь не сохранился:',e)
+
+    def _real_layout(self):
+        """Реальная раскладка X-сервера (setxkbmap -query) — не полагаемся на self._layout,
+        потому что GNOME/mutter переключает раскладку сам (input-sources)."""
+        try:
+            r=subprocess.run(['setxkbmap','-query'],capture_output=True,text=True,
+                             env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
+            for ln in r.stdout.splitlines():
+                if ln.strip().startswith('layout:'):
+                    return ln.split()[-1]
+        except Exception:
+            pass
+        return self._layout
+
+    def _t9_type(self,word,space):
+        """Ввод русского слова через XTest: временно ru-раскладка, затем вернуть как было.
+        Используем физические keycode ЙЦУКЕН — они не зависят от кэша раскладки python-xlib."""
+        # физические keycode русской ЙЦУКЕН (PC-клавиатура, проверено на сервере 33/33)
+        RU_KC={'й':24,'ц':25,'у':26,'к':27,'е':28,'н':29,'г':30,'ш':31,'щ':32,'з':33,'х':34,'ъ':35,
+               'ф':38,'ы':39,'в':40,'а':41,'п':42,'р':43,'о':44,'л':45,'д':46,'ж':47,'э':48,'ё':49,
+               'я':52,'ч':53,'с':54,'м':55,'и':56,'т':57,'ь':58,'б':59,'ю':60}
+        real=self._real_layout()
+        try:
+            if real!='ru':
+                subprocess.run(['setxkbmap','ru'], capture_output=True,
+                               env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
+                time.sleep(0.15)  # дать X-серверу обновить раскладку
+                # ВАЖНО: НЕ обновляем кэш python-xlib! _kv() полагается на us-кэш
+                # (латинские keysym'ы) и вводит физические keycode — реальная раскладка
+                # превращает их в русские буквы. _update_keymap сломал бы латинский ввод.
+            for i,ch in enumerate(word):
+                kc=RU_KC.get(ch,0)
+                if kc:
+                    if self._t9_caps and i==0:
+                        xtest.fake_input(self.d,X.KeyPress,50); self.d.flush()  # Shift
+                    xtest.fake_input(self.d,X.KeyPress,kc); self.d.flush()
+                    xtest.fake_input(self.d,X.KeyRelease,kc); self.d.flush()
+                    if self._t9_caps and i==0:
+                        xtest.fake_input(self.d,X.KeyRelease,50); self.d.flush()
+            self._t9_caps=False  # заглавная — только для первого слова после Shift
+            if space:
+                xtest.fake_input(self.d,X.KeyPress,65); self.d.flush()
+                xtest.fake_input(self.d,X.KeyRelease,65); self.d.flush()
+        finally:
+            # в Т9-режиме всегда возвращаемся на ru (Т9 = русский ввод), иначе — как было
+            target='ru' if self._t9_active else real
+            if self._real_layout()!=target:
+                subprocess.run(['setxkbmap',target], capture_output=True,
+                               env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
+                time.sleep(0.2)  # дать X-серверу применить раскладку — иначе XTest-события теряются
+        self._layout=target  # синхронизация с реальной раскладкой
+
+    def _t9_osd_show(self):
+        if self._t9_osd is None:
+            self._t9_osd=T9OSD()
+        text=self._t9.osd_text()
+        if self._t9_caps:
+            text='<span color="#6f6" size="large">🔠 С ЗАГЛАВНОЙ</span>  '+text
+        self._t9_osd.update(text)
+
+    def _t9_osd_hide(self):
+        if self._t9_osd is not None:
+            self._t9_osd.hide()
 
     def _kv(self,s,p,raw=0):
         if not p:
@@ -383,7 +550,7 @@ class Hub:
             subprocess.run(
                 ['xdotool','type','--clearmodifiers','--delay','0',chr(s)],
                 capture_output=True, timeout=1,
-                env={'DISPLAY': os.environ.get('DISPLAY',':0')})
+                env={'DISPLAY': os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
         except Exception:
             pass
     def run(self):
@@ -391,10 +558,10 @@ class Hub:
         self.ro.warp_pointer(self.sw//2,self.sh//2); self.d.flush()
         # Switch to US layout — CardKB is a US QWERTY keyboard
         subprocess.run(['setxkbmap','us'], capture_output=True,
-                       env={'DISPLAY':os.environ.get('DISPLAY',':0')})
+                       env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
         print('[m5hub] 🇺🇸 Раскладка: US')
         subprocess.run(['xdotool','mousemove',str(self.sw//2),str(self.sh//2)],
-                       capture_output=True, env={'DISPLAY':os.environ.get('DISPLAY',':0')})
+                       capture_output=True, env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
         for r,g,b in [(50,0,0),(0,50,0),(0,0,50),(0,0,0)]:
             self._led(r,g,b); time.sleep(0.08)
         # Гасим LED джойстика при старте
@@ -406,10 +573,10 @@ class Hub:
                 if t-self._t['j']>=0.030: self._j(); self._t['j']=t
                 if t-self._t['s']>=0.020: self._s(); self._t['s']=t
                 if t-self._t['k']>=0.060: self._k(); self._t['k']=t
-                # Backspace auto-repeat
-                if self._bs_repeat and t>=self._bs_next:
-                    self._kv(0xFF08,1,0x08); self._kv(0xFF08,0,0x08)
-                    self._bs_next=t+0.05
+                # Поддержание зелёного LED джойстика, пока Т9 активен (STM32G0 гаснет по таймауту)
+                if self._t9_active and t-self._t9_led_t>=2.0:
+                    self._led_j(0,80,0)
+                    self._t9_led_t=t
                 time.sleep(0.002)
             except KeyboardInterrupt: break
         print(f"[m5hub] Off (ошибок I2C: {self._err_count})")
@@ -421,7 +588,7 @@ class Hub:
         os.close(self.fd); self.d.close()
         # Restore original layout
         subprocess.run(['setxkbmap','us,ru,ru'], capture_output=True,
-                       env={'DISPLAY':os.environ.get('DISPLAY',':0')})
+                       env={'DISPLAY':os.environ.get('DISPLAY',':0'),'XAUTHORITY':os.environ.get('XAUTHORITY','/home/orangepi/.Xauthority')})
         print('[m5hub] 🇷🇺 Раскладка восстановлена')
 
 
@@ -460,6 +627,144 @@ CKM = {
     **{c: c for c in range(0x5C, 0x7F)},  # \ through ~
     **{c: c for c in range(0x61, 0x7B)},  # a-z
 }
+
+
+# ── Т9-движок и OSD-окно (русский набор цифрами) ───────────────────
+_T9_BASE='/home/orangepi/.openclaw/workspace/t9/ru_t9.json'
+_T9_LAYOUT={'2':'абвг','3':'деёжз','4':'ийкл','5':'мноп','6':'рсту','7':'фхцч','8':'шщъы','9':'ьэюя'}
+_T9_KEY={}
+for _k,_v in _T9_LAYOUT.items():
+    for _ch in _v: _T9_KEY[_ch]=_k
+_T9_KEY['ё']='3'
+
+class T9Engine:
+    """Последовательность цифр -> кандидаты по частоте (база: ru_t9.json)."""
+    def __init__(self,base_path=_T9_BASE):
+        with open(base_path,encoding='utf-8') as f:
+            self.base=json.load(f)
+        self.seq=''; self.cands=[]; self.idx=0
+        # multi-tap (ручной ввод слова, которого нет в словаре)
+        self.mt=False; self.mt_word=''; self.mt_cur=''; self.mt_last_d=None; self.mt_last_t=0.0
+    def add_digit(self,d):
+        self.seq+=d; self._recalc()
+    def backspace(self):
+        if self.seq:
+            self.seq=self.seq[:-1]; self._recalc()
+    def next_cand(self):
+        if self.cands: self.idx=(self.idx+1)%len(self.cands)
+    def prev_cand(self):
+        if self.cands: self.idx=(self.idx-1)%len(self.cands)
+    def confirm(self):
+        w=self.cands[self.idx] if self.cands else None
+        self.reset(); return w
+    def reset(self):
+        self.seq=''; self.cands=[]; self.idx=0
+        self.mt=False; self.mt_word=''; self.mt_cur=''; self.mt_last_d=None
+    def _recalc(self):
+        self.cands=self.base.get(self.seq,[]); self.idx=0
+
+    # ── multi-tap: ручной ввод слова ──
+    def mt_start(self):
+        self.mt=True; self.mt_word=''; self.mt_cur=''; self.mt_last_d=None; self.mt_last_t=0.0
+    def mt_digit(self,d,now):
+        """Нажатие цифры в multi-tap: повтор <0.5с — следующая буква группы."""
+        grp=_T9_LAYOUT[d]
+        if self.mt_last_d==d and self.mt_cur and now-self.mt_last_t<0.5:
+            self.mt_cur=grp[(grp.index(self.mt_cur)+1)%len(grp)]
+        else:
+            if self.mt_cur: self.mt_word+=self.mt_cur   # фиксация предыдущей буквы
+            self.mt_cur=grp[0]
+        self.mt_last_d=d; self.mt_last_t=now
+    def mt_backspace(self):
+        if self.mt_word: self.mt_word=self.mt_word[:-1]
+        self.mt_cur=''; self.mt_last_d=None
+    def mt_finish(self):
+        w=self.mt_word+self.mt_cur
+        self.mt=False; self.mt_word=''; self.mt_cur=''; self.mt_last_d=None
+        return w
+    def mt_cancel(self):
+        self.mt=False; self.mt_word=''; self.mt_cur=''; self.mt_last_d=None
+    def mt_text(self):
+        return self.mt_word+self.mt_cur
+    def add_word(self,word):
+        """Добавить слово в словарь (в начало кандидатов). Возвращает Т9-код."""
+        seq=''.join(_T9_KEY.get(c,'') for c in word.lower())
+        if not seq: return None
+        lst=self.base.get(seq,[])
+        if word in lst: lst.remove(word)
+        self.base[seq]=[word]+lst
+        return seq
+
+    def osd_text(self):
+        if self.mt:
+            # multi-tap: слово красным (режим добавления нового слова)
+            return (f'<span color="#f55" size="large">✍️</span> '
+                    f'<b><span color="#f55" size="large">{self.mt_text() or "_"}</span></b> '
+                    f'<span color="#aaa">· цифра — буква (быстрый повтор — след.) · Enter — готово</span>')
+        if not self.seq:
+            return '<span color="#777">Т9: 2-9 буквы · Backspace стереть · ←/→ выбор · Space/0 подтвердить · Fn+Tab выкл</span>'
+        if not self.cands:
+            return f'<span color="#f66">нет слова: {self.seq}</span> <span color="#aaa">— Enter: ручной ввод</span>'
+        parts=[]
+        for i,w in enumerate(self.cands[:8]):
+            if i==self.idx:
+                parts.append(f'<b><span color="#fff" background="#264" size="large">{w}</span></b>')
+            else:
+                parts.append(f'<span color="#aaa" size="large">{w}</span>')
+        more=f' <span color="#666">+{len(self.cands)-8}</span>' if len(self.cands)>8 else ''
+        return '  '.join(parts)+more
+
+class T9OSD:
+    """GTK-подсказка внизу по центру экрана. Не берёт фокус."""
+    def __init__(self):
+        self.q=queue.Queue()
+        self.visible=False; self.win=None; self.label=None
+        threading.Thread(target=self._run,daemon=True).start()
+    def _run(self):
+        if gi is None:
+            return
+        gi.require_version('Gtk','3.0')
+        from gi.repository import Gtk, GLib
+        Gtk.init(None)
+        self.win=Gtk.Window(type=Gtk.WindowType.POPUP)
+        self.win.set_decorated(False); self.win.set_keep_above(True)
+        self.win.set_accept_focus(False); self.win.set_can_focus(False)
+        self.win.set_skip_taskbar_hint(True); self.win.set_skip_pager_hint(True)
+        # Полупрозрачность 50%: rgba-визуал + draw с альфой (текст остаётся непрозрачным)
+        screen=self.win.get_screen()
+        vis=screen.get_rgba_visual()
+        if vis is not None:
+            self.win.set_visual(vis)
+        self.win.set_app_paintable(True)
+        def _draw(w,cr):
+            cr.set_source_rgba(0.12,0.12,0.12,0.5)  # тёмный фон, альфа 50%
+            cr.paint()
+            return False
+        self.win.connect('draw',_draw)
+        self.win.set_size_request(520,48)
+        sw,sh=screen.get_width(),screen.get_height()
+        self.win.move((sw-520)//2,sh-60)
+        self.label=Gtk.Label(); self.label.set_use_markup(True)
+        self.label.set_halign(Gtk.Align.CENTER)
+        self.win.add(self.label); self.win.show_all(); self.win.hide()
+        GLib.timeout_add(40,self._poll)
+        Gtk.main()
+    def _poll(self):
+        try:
+            while True:
+                text,show=self.q.get_nowait()
+                self.label.set_markup(text or '')
+                if show and not self.visible:
+                    self.win.show(); self.visible=True
+                elif not show and self.visible:
+                    self.win.hide(); self.visible=False
+        except queue.Empty:
+            pass
+        return True
+    def update(self,markup):
+        self.q.put((markup,True))
+    def hide(self):
+        self.q.put(('',False))
 
 
 if __name__=='__main__':
